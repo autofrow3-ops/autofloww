@@ -19,7 +19,11 @@ from flask import current_app, has_app_context
 
 from app.models import AISettings, Company, Conversation
 from app.services.ai_tools import build_default_registry
-from app.services.conversation_service import HANDOFF_CONFIRMATION, ConversationOperations
+from app.services.conversation_service import (
+    AI_RESUME_CURSOR,
+    HANDOFF_CONFIRMATION,
+    ConversationOperations,
+)
 from app.services.exceptions import ConflictError, ExternalServiceError, ValidationError
 from app.services.tool_registry import ToolContext, ToolRegistry
 
@@ -268,14 +272,17 @@ REGRAS ABSOLUTAS:
                 letters = candidate.replace("-", "").replace("'", "").replace("’", "")
                 if letters.isalpha():
                     first_name = candidate
-        messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": self.build_system_prompt(
-                    company, settings, customer_first_name=first_name
-                ),
-            }
-        ]
+        system_prompt = self.build_system_prompt(
+            company, settings, customer_first_name=first_name
+        )
+        if AI_RESUME_CURSOR in (conversation.memory_json or {}):
+            system_prompt += (
+                "\n\nA equipe encerrou o atendimento humano e devolveu esta conversa à IA. "
+                "Continue atendendo normalmente. Pedidos de atendente no histórico ou no "
+                "resumo já foram tratados. Use transfer_to_human apenas se o cliente "
+                "pedir atendimento humano no turno atual."
+            )
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         if conversation.summary:
             messages.append(
                 {

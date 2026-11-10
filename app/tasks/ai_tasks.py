@@ -16,7 +16,11 @@ from app.models.base import utcnow
 from app.security import decrypt_secret
 from app.services.ai import AnswerConversationService, SummarizeConversationService
 from app.services.auth import SendPasswordResetEmailService
-from app.services.conversation_service import HANDOFF_CONFIRMATION_KEY, ConversationOperations
+from app.services.conversation_service import (
+    AI_RESUME_CURSOR,
+    HANDOFF_CONFIRMATION_KEY,
+    ConversationOperations,
+)
 from app.services.conversations import (
     RecordOutboundMessageService,
     SetConversationSummaryService,
@@ -100,6 +104,21 @@ def process_message(self, message_id: int) -> dict:
         return {"status": "ignored", "message_id": message.id}
     if message.processing_status in {"PROCESSED", "SKIPPED"}:
         return {"status": message.processing_status.lower(), "message_id": message.id}
+    company_id = message.company_id
+    conversation = Conversation.query.filter_by(
+        id=message.conversation_id, company_id=company_id
+    ).with_for_update().one()
+    resume_cursor = (conversation.memory_json or {}).get(AI_RESUME_CURSOR, 0)
+    if (
+        conversation.ai_status != "ACTIVE"
+        or conversation.human_requested
+        or message.id <= resume_cursor
+    ):
+        message.processing_status = "SKIPPED"
+        message.processed_at = utcnow()
+        _release_conversation(conversation.id, message.id)
+        db.session.commit()
+        return {"status": "ai_paused", "message_id": message.id}
     if message.processing_status == "PROCESSING":
         processing_started = _parse_timestamp(
             (message.ai_metadata_json or {}).get("processing_started_at")
@@ -107,15 +126,6 @@ def process_message(self, message_id: int) -> dict:
         if processing_started and utcnow() - processing_started < PROCESSING_LEASE:
             db.session.rollback()
             raise self.retry(countdown=3, max_retries=20)
-    company_id = message.company_id
-    conversation = Conversation.query.filter_by(
-        id=message.conversation_id, company_id=company_id
-    ).with_for_update().one()
-    if conversation.ai_status != "ACTIVE" or conversation.human_requested:
-        message.processing_status = "SKIPPED"
-        message.processed_at = utcnow()
-        db.session.commit()
-        return {"status": "ai_paused", "message_id": message.id}
     if not _claim_conversation(conversation, message.id):
         db.session.rollback()
         raise self.retry(countdown=2, max_retries=20)
@@ -136,6 +146,7 @@ def process_message(self, message_id: int) -> dict:
                 Message.company_id == company_id,
                 Message.conversation_id == conversation.id,
                 Message.direction == "INBOUND",
+                Message.id > resume_cursor,
                 Message.processing_status.in_(("PENDING", "PROCESSING")),
             )
             .order_by(Message.id.desc())
@@ -164,6 +175,7 @@ def process_message(self, message_id: int) -> dict:
             row.id
             for row in history
             if row.direction == "INBOUND"
+            and row.id > resume_cursor
             and row.processing_status in {"PENDING", "PROCESSING"}
             and row.content
         ]
@@ -185,7 +197,11 @@ def process_message(self, message_id: int) -> dict:
         inbound = Message.query.filter_by(
             id=message.id, company_id=company_id
         ).with_for_update().one()
-        if conversation.ai_status != "ACTIVE" or conversation.human_requested:
+        if (
+            conversation.ai_status != "ACTIVE"
+            or conversation.human_requested
+            or inbound.id <= (conversation.memory_json or {}).get(AI_RESUME_CURSOR, 0)
+        ):
             inbound.processing_status = "SKIPPED"
             inbound.processed_at = utcnow()
             _release_conversation(conversation.id, inbound.id)
@@ -273,6 +289,7 @@ def process_message(self, message_id: int) -> dict:
                 and (
                     conversation.ai_status != "ACTIVE"
                     or conversation.human_requested
+                    or failed.id <= (conversation.memory_json or {}).get(AI_RESUME_CURSOR, 0)
                 )
             )
             failed.processing_status = "SKIPPED" if paused else "FAILED"
@@ -360,7 +377,13 @@ def send_whatsapp_message(self, message_id: int) -> dict:
             message.error_message = "Handoff superseded before WhatsApp delivery"
             db.session.commit()
             return {"status": "handoff_superseded", "message_id": message.id}
-    elif message.sender_type == "AI" and ai_paused:
+    elif message.sender_type == "AI" and (
+        ai_paused
+        or (
+            message.reply_to_id is not None
+            and message.reply_to_id <= (conversation.memory_json or {}).get(AI_RESUME_CURSOR, 0)
+        )
+    ):
         message.status = "FAILED"
         message.processing_status = "SKIPPED"
         message.error_message = "AI paused before WhatsApp delivery"

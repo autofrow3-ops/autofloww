@@ -16,6 +16,7 @@ from app.services.tenancy import ensure_same_company, tenant_get
 GROQ_OUTBOUND_STATUSES = ("SENT", "DELIVERED", "READ")
 HANDOFF_CONFIRMATION = "Vou encaminhar você para um atendente humano. Por favor, aguarde um momento."
 HANDOFF_CONFIRMATION_KEY = "ai-handoff-confirmation:"
+AI_RESUME_CURSOR = "ai_resumed_through_message_id"
 
 
 class ConversationOperations:
@@ -97,6 +98,7 @@ class ConversationOperations:
         if existing:
             return existing, False
         conversation = tenant_get(Conversation, company_id, conversation_id, lock=True)
+        db.session.refresh(conversation, with_for_update=True)
         message = Message(
             company_id=int(company_id),
             conversation_id=conversation.id,
@@ -118,6 +120,10 @@ class ConversationOperations:
         db.session.add(message)
         try:
             db.session.flush()
+            conversation.memory_json = {
+                **(conversation.memory_json or {}),
+                "last_inbound_message_id": message.id,
+            }
             if commit:
                 db.session.commit()
         except IntegrityError:
@@ -355,14 +361,24 @@ class ConversationOperations:
         db.session.refresh(conversation, with_for_update=True)
         if user_id and conversation.assigned_user_id not in {None, user_id}:
             raise AuthorizationError("Only the assigned agent can return this conversation")
+        if conversation.ai_status != "ACTIVE" or conversation.human_requested:
+            memory = dict(conversation.memory_json or {})
+            # Inbound writes update this ID under the same conversation lock.
+            # Use the message table for conversations created before this marker.
+            last_message_id = memory.get("last_inbound_message_id")
+            if last_message_id is None:
+                last_message_id = db.session.query(db.func.max(Message.id)).filter_by(
+                    company_id=company_id, conversation_id=conversation.id, direction="INBOUND"
+                ).scalar()
+            memory[AI_RESUME_CURSOR] = last_message_id or 0
+            memory.pop("processing_message_id", None)
+            memory.pop("processing_started_at", None)
+            memory.pop("handoff_confirmation_id", None)
+            conversation.memory_json = memory
         conversation.assigned_user_id = None
         conversation.human_requested = False
         conversation.ai_status = "ACTIVE"
         conversation.status = "OPEN"
-        if (conversation.memory_json or {}).get("handoff_confirmation_id"):
-            memory = dict(conversation.memory_json)
-            memory.pop("handoff_confirmation_id")
-            conversation.memory_json = memory
         if commit:
             db.session.commit()
         return conversation

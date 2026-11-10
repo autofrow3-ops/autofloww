@@ -166,6 +166,74 @@ def test_agent_claim_during_groq_stays_in_control(chat, tenant_user, monkeypatch
     assert not TaskOutbox.query.count()
 
 
+def test_new_message_gets_whatsapp_reply_after_return_to_ai(
+    chat, tenant_user, client, login_as, monkeypatch
+):
+    conversation, _ = chat
+    login_as(tenant_user)
+    url = f"/conversations/{conversation.id}"
+    assert client.post(f"{url}/assume", json={}).status_code == 200
+    previous_request, _ = ConversationOperations.record_inbound(
+        conversation.company_id,
+        conversation_id=conversation.id,
+        content="Ainda estou aguardando um atendente.",
+        external_message_id="during-human-support",
+    )
+    assert client.post(f"{url}/return-to-ai", json={}).status_code == 200
+
+    new_question, _ = ConversationOperations.record_inbound(
+        conversation.company_id,
+        conversation_id=conversation.id,
+        content="Qual é o horário de atendimento?",
+        external_message_id="after-return",
+    )
+    # A repeated click must not move the boundary past the customer's new message.
+    assert client.post(f"{url}/return-to-ai", json={}).status_code == 200
+
+    def groq(gateway, messages, **kwargs):
+        assert "devolveu esta conversa à IA" in messages[0]["content"]
+        assert messages[-1]["content"] == new_question.content
+        return {"choices": [{"message": {"content": "Atendemos das 9h às 18h."}}]}
+
+    sent = []
+
+    def fake_send(service, company_id, **kwargs):
+        sent.append(kwargs["text"])
+        return {"key": {"id": "resumed-ai-reply"}}
+
+    monkeypatch.setattr(GroqService, "chat_completion", groq)
+    monkeypatch.setattr(WhatsAppService, "send_text", fake_send)
+    result = process_message.run(new_question.id)
+    assert result["batched_message_ids"] == [new_question.id]
+    process_message.run(previous_request.id)
+    assert previous_request.processing_status == "SKIPPED"
+    assert send_whatsapp_message.run(result["outbound_message_id"])["status"] == "sent"
+    assert sent == ["Atendemos das 9h às 18h."]
+    assert conversation.ai_status == "ACTIVE"
+
+
+def test_in_flight_answer_is_discarded_after_human_claim_and_return(
+    chat, tenant_user, monkeypatch
+):
+    conversation, inbound = chat
+    # Exercise a conversation persisted before inbound IDs were tracked in memory.
+    conversation.memory_json = {}
+    db.session.commit()
+
+    def groq(*args, **kwargs):
+        ConversationOperations.claim(
+            conversation.company_id, conversation.id, user_id=tenant_user.id
+        )
+        ConversationOperations.return_to_ai(conversation.company_id, conversation.id)
+        return {"choices": [{"message": {"content": "Resposta antiga."}}]}
+
+    monkeypatch.setattr(GroqService, "chat_completion", groq)
+    assert process_message.run(inbound.id)["status"] == "ai_paused_before_persist"
+    assert inbound.processing_status == "SKIPPED"
+    assert not Message.query.filter_by(direction="OUTBOUND").count()
+    assert "processing_message_id" not in conversation.memory_json
+
+
 def test_outbox_failure_rolls_back_entire_handoff(chat, monkeypatch):
     conversation, _ = chat
 
